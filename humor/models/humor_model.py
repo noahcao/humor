@@ -213,11 +213,11 @@ class HumorModel(nn.Module):
             # need a body model to compute the joints after each step.
             print('Using SMPL joints rather than regressed joints as input at each step for roll out and scheduled sampling...')
             male_bm_path = os.path.join(SMPLH_PATH, 'male/model.npz')
-            self.male_bm = BodyModel(bm_path=male_bm_path, num_betas=16, batch_size=self.args.batch_size)
+            self.male_bm = BodyModel(bm_path=male_bm_path, num_betas=16, batch_size=50)
             female_bm_path = os.path.join(SMPLH_PATH, 'female/model.npz')
-            self.female_bm = BodyModel(bm_path=female_bm_path, num_betas=16, batch_size=self.args.batch_size)
+            self.female_bm = BodyModel(bm_path=female_bm_path, num_betas=16, batch_size=50)
             neutral_bm_path = os.path.join(SMPLH_PATH, 'neutral/model.npz')
-            self.neutral_bm = BodyModel(bm_path=neutral_bm_path, num_betas=16, batch_size=self.args.batch_size)
+            self.neutral_bm = BodyModel(bm_path=neutral_bm_path, num_betas=16, batch_size=50)
             self.bm_dict = {'male' : self.male_bm, 'female' : self.female_bm, 'neutral' : self.neutral_bm}
             for p in self.male_bm.parameters():
                 p.requires_grad = False

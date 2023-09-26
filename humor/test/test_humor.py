@@ -97,7 +97,7 @@ def test(args_obj, config_file):
         Logger.log('Saved checkpoint is from epoch idx %d with min val loss %.6f...' % (start_epoch, min_val_loss))
     else:
         Logger.log('ERROR: No weight specified to load!!')
-        # return
+        return
 
     # load dataset class and instantiate training and validation set
     if args.test_on_train:
@@ -250,21 +250,26 @@ def eval_sampling(model, test_dataset, test_loader, device,
             # all_samples_joints.append(x_pred_dict['joints'])
             # import pdb; pdb.set_trace()
             all_smpl_joints3d = get_smpl_joints(global_gt_dict, x_pred_dict, meta, male_bm, female_bm, viz=False)
-                # import pdb; pdb.set_trace()
-                # visualize and save
-                # print('Visualizing sample %d/%d!' % (samp_idx+1, num_samples))
-                # imsize = (1080, 1080)
-                # cur_res_out_list = batch_res_out_list
-                # if res_out_dir is not None:
-                #     cur_res_out_list = [out_path + '_samp%d' % (samp_idx) for out_path in batch_res_out_list]
-                #     imsize = (720, 720)
-                # viz_eval_samp(global_gt_dict, x_pred_dict, meta, male_bm, female_bm, cur_res_out_list,
-                #                 imw=imsize[0],
-                #                 imh=imsize[1],
-                #                 show_smpl_joints=viz_smpl_joints,
-                #                 show_pred_joints=viz_pred_joints,
-                #                 show_contacts=viz_contacts
-                #               )
+            # import pdb; pdb.set_trace()
+            # visualize and save
+            for samp_idx in range(num_samples):
+                print('Visualizing sample %d/%d!' % (samp_idx+1, num_samples))
+                imsize = (1080, 1080)
+                cur_res_out_list = batch_res_out_list
+                if res_out_dir is not None:
+                    cur_res_out_list = [out_path + '_samp%d' % (samp_idx) for out_path in batch_res_out_list]
+                    imsize = (720, 720)
+                
+                viz_eval_single_samp(global_gt_dict, x_pred_dict, meta, male_bm, female_bm, cur_res_out_list,
+                                imw=imsize[0],
+                                imh=imsize[1],
+                                show_smpl_joints=viz_smpl_joints,
+                                show_pred_joints=viz_pred_joints,
+                                show_contacts=viz_contacts,
+                                b=samp_idx
+                                )
+                
+                
             all_smpl_joints3d = all_smpl_joints3d.reshape((B, FINAL_EVAL_DIV_NSAMP, -1, 3))
             samp_dist_mat = torch.zeros((B, FINAL_EVAL_DIV_NSAMP, FINAL_EVAL_DIV_NSAMP-1))
             for sidx in range(FINAL_EVAL_DIV_NSAMP):
@@ -293,7 +298,6 @@ def eval_sampling(model, test_dataset, test_loader, device,
             #         all_samples_logger[seq_name].append(joint_distance)
             # seq_mean = sum(all_samples_logger[seq_name]) / len(all_samples_logger[seq_name])
             # print("{}: APD = {}".format(seq_name, seq_mean))
-    import pdb; pdb.set_trace()
     
     # compute aggregate means
     agg_adp = torch.cat(apd_list, dim=0).detach().cpu().numpy()
@@ -462,6 +466,88 @@ def eval_recon(model, test_dataset, test_loader, device,
                             show_contacts=viz_contacts
                             )
 
+
+def viz_eval_single_samp(global_gt_dict, x_pred_dict, meta, male_bm, female_bm, out_path_list,
+                    imw=720,
+                    imh=720,
+                    show_pred_joints=False,
+                    show_smpl_joints=False,
+                    show_contacts=False,
+                    b=0):
+    '''
+    Given x_pred_dict from the model rollout and the ground truth dict, runs through SMPL model to visualize
+    '''
+    J = len(SMPL_JOINTS)
+    V = NUM_KEYPT_VERTS
+
+    pred_world_root_orient = x_pred_dict['root_orient']
+    B, T, _ = pred_world_root_orient.size()
+    pred_world_root_orient = rotation_matrix_to_angle_axis(pred_world_root_orient.reshape((B*T, 3, 3))).reshape((B, T, 3))
+    pred_world_pose_body = x_pred_dict['pose_body']
+    pred_world_pose_body = rotation_matrix_to_angle_axis(pred_world_pose_body.reshape((B*T*(J-1), 3, 3))).reshape((B, T, (J-1)*3))
+    pred_world_trans = x_pred_dict['trans']
+    pred_world_joints = x_pred_dict['joints'].reshape((B, T, J, 3))
+    
+    if B > 1:
+        out_path_list = out_path_list * B
+        for i in range(B):
+            out_path_list[i].replace('samp0', 'samp{}'.format(i))
+
+    viz_contacts = [None]*B
+    if show_contacts and 'contacts' in x_pred_dict.keys():
+        pred_contacts = torch.sigmoid(x_pred_dict['contacts'])
+        pred_contacts = (pred_contacts > CONTACT_THRESH).to(torch.float)
+        viz_contacts = torch.zeros((B, T, len(SMPL_JOINTS))).to(pred_contacts)
+        viz_contacts[:,:,CONTACT_INDS] = pred_contacts
+        pred_contacts = viz_contacts
+
+    betas = meta['betas'].to(global_gt_dict[list(global_gt_dict.keys())[0]].device)
+
+    bm_world = male_bm if meta['gender'][b] == 'male' else female_bm
+    # pred
+    body_pred = bm_world(pose_body=pred_world_pose_body[b], 
+                    pose_hand=None,
+                    betas=betas[b,0].reshape((1, -1)).expand((T, 16)),
+                    root_orient=pred_world_root_orient[b],
+                    trans=pred_world_trans[b])
+
+    pred_smpl_joints = body_pred.Jtr[:, :J]
+    viz_joints = None
+    if show_smpl_joints:
+        viz_joints = pred_smpl_joints
+    elif show_pred_joints:
+        viz_joints = pred_world_joints[b]
+
+    # import pdb; pdb.set_trace()
+    cur_offscreen = out_path_list[b] is not None
+    from viz.utils import viz_smpl_seq, create_video
+    body_alpha = 0.5 if viz_joints is not None and cur_offscreen else 1.0
+    viz_smpl_seq(body_pred,
+                    imw=imw, imh=imh, fps=30,
+                    render_body=True,
+                    render_joints=viz_joints is not None,
+                    render_skeleton=viz_joints is not None and cur_offscreen,
+                    render_ground=True,
+                    contacts=viz_contacts[b],
+                    joints_seq=viz_joints,
+                    body_alpha=body_alpha,
+                    use_offscreen=cur_offscreen,
+                    out_path=out_path_list[b],
+                    wireframe=False,
+                    RGBA=False,
+                    follow_camera=True,
+                    cam_offset=[0.0, 2.2, 0.9],
+                    joint_color=[ 0.0, 1.0, 0.0 ],
+                    point_color=[0.0, 0.0, 1.0],
+                    skel_color=[0.5, 0.5, 0.5],
+                    joint_rad=0.015,
+                    point_rad=0.015
+            )
+
+    if cur_offscreen:
+        create_video(out_path_list[b] + '/frame_%08d.' + '%s' % ('png'), out_path_list[b] + '.mp4', 30)
+
+
 def viz_eval_samp(global_gt_dict, x_pred_dict, meta, male_bm, female_bm, out_path_list,
                     imw=720,
                     imh=720,
@@ -481,6 +567,11 @@ def viz_eval_samp(global_gt_dict, x_pred_dict, meta, male_bm, female_bm, out_pat
     pred_world_pose_body = rotation_matrix_to_angle_axis(pred_world_pose_body.reshape((B*T*(J-1), 3, 3))).reshape((B, T, (J-1)*3))
     pred_world_trans = x_pred_dict['trans']
     pred_world_joints = x_pred_dict['joints'].reshape((B, T, J, 3))
+    
+    if B > 1:
+        out_path_list = out_path_list * B
+        for i in range(B):
+            out_path_list[i].replace('samp0', 'samp{}'.format(i))
 
     viz_contacts = [None]*B
     if show_contacts and 'contacts' in x_pred_dict.keys():
@@ -507,6 +598,7 @@ def viz_eval_samp(global_gt_dict, x_pred_dict, meta, male_bm, female_bm, out_pat
         elif show_pred_joints:
             viz_joints = pred_world_joints[b]
 
+        # import pdb; pdb.set_trace()
         cur_offscreen = out_path_list[b] is not None
         from viz.utils import viz_smpl_seq, create_video
         body_alpha = 0.5 if viz_joints is not None and cur_offscreen else 1.0
