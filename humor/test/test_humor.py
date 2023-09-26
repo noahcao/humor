@@ -9,7 +9,8 @@ import numpy as np
 
 import torch
 from torch.utils.data import DataLoader
-
+import csv
+from datasets.amass_discrete_dataset import CONTACT_INDS
 from utils.config import TestConfig
 from utils.logging import Logger, class_name_to_file_name, mkdir, cp_files
 from utils.torch import get_device, save_state, load_state
@@ -18,8 +19,14 @@ from utils.transforms import rotation_matrix_to_angle_axis
 from body_model.utils import SMPL_JOINTS
 from datasets.amass_utils import NUM_KEYPT_VERTS, CONTACT_INDS
 from losses.humor_loss import CONTACT_THRESH
+from tqdm import tqdm 
+import einops
 
 NUM_WORKERS = 0
+
+FINAL_EVAL_PRED_NSAMP = 50
+FINAL_EVAL_DIV_NSAMP = 50
+FINAL_EVAL_DIV_SAMP_LEN = 5 * 30 # 5 s at 30 fps
 
 def parse_args(argv):
     # create config and parse args
@@ -193,10 +200,13 @@ def eval_sampling(model, test_dataset, test_loader, device,
     male_bm = BodyModel(bm_path=male_bm_path, num_betas=16, batch_size=eval_qual_samp_len).to(device)
     female_bm = BodyModel(bm_path=female_bm_path, num_betas=16, batch_size=eval_qual_samp_len).to(device)
 
+    all_samples_logger = {}
+    apd_list = []
     with torch.no_grad():
         test_dataset.pre_batch()
         model.eval()
-        for i, data in enumerate(test_loader):
+        
+        for i, data in enumerate(tqdm(test_loader)):
             # get inputs
             batch_in, batch_out, meta = data
             print(meta['path'])
@@ -217,26 +227,141 @@ def eval_sampling(model, test_dataset, test_loader, device,
             x_past = x_past[:,0,:,:] # only need input for first step
             rollout_input_dict = dict()
             for k in input_dict.keys():
-                rollout_input_dict[k] = input_dict[k][:,0,:,:] # only need first step
+                if len(input_dict[k][:,0,:,:].shape) == 3:  
+                    rollout_input_dict[k] = input_dict[k][:,0,:,:].repeat(num_samples, 1, 1) # only need first step
+                elif len(input_dict[k][:,0,:,:].shape) == 4:  
+                    rollout_input_dict[k] = input_dict[k][:,0,:,:].repeat(num_samples, 1, 1, 1) # only need first step
+                else:
+                    assert False
 
             # sample same trajectory multiple times and save the joints/contacts output
-            for samp_idx in range(num_samples):
-                x_pred_dict = model.roll_out(x_past, rollout_input_dict, eval_qual_samp_len, gender=meta['gender'], betas=meta['betas'].to(device))
+            # all_samples_joints = []
+            
+            all_smpl_joints3d = torch.zeros((B, FINAL_EVAL_DIV_NSAMP, FINAL_EVAL_DIV_SAMP_LEN, J, 3)).to(device)
+            
+            x_past = x_past.repeat(num_samples, 1, 1)
+            # for samp_idx in range(num_samples):
+            #     # import pdb; pdb.set_trace()
+            x_pred_dict = model.roll_out(x_past, rollout_input_dict, 
+                                            eval_qual_samp_len, 
+                                            gender=meta['gender']*num_samples, 
+                                            betas=(meta['betas'].repeat(num_samples, 1,1)).to(device))
 
+            # all_samples_joints.append(x_pred_dict['joints'])
+            # import pdb; pdb.set_trace()
+            all_smpl_joints3d = get_smpl_joints(global_gt_dict, x_pred_dict, meta, male_bm, female_bm, viz=False)
+                # import pdb; pdb.set_trace()
                 # visualize and save
-                print('Visualizing sample %d/%d!' % (samp_idx+1, num_samples))
-                imsize = (1080, 1080)
-                cur_res_out_list = batch_res_out_list
-                if res_out_dir is not None:
-                    cur_res_out_list = [out_path + '_samp%d' % (samp_idx) for out_path in batch_res_out_list]
-                    imsize = (720, 720)
-                viz_eval_samp(global_gt_dict, x_pred_dict, meta, male_bm, female_bm, cur_res_out_list,
-                                imw=imsize[0],
-                                imh=imsize[1],
-                                show_smpl_joints=viz_smpl_joints,
-                                show_pred_joints=viz_pred_joints,
-                                show_contacts=viz_contacts
-                              )
+                # print('Visualizing sample %d/%d!' % (samp_idx+1, num_samples))
+                # imsize = (1080, 1080)
+                # cur_res_out_list = batch_res_out_list
+                # if res_out_dir is not None:
+                #     cur_res_out_list = [out_path + '_samp%d' % (samp_idx) for out_path in batch_res_out_list]
+                #     imsize = (720, 720)
+                # viz_eval_samp(global_gt_dict, x_pred_dict, meta, male_bm, female_bm, cur_res_out_list,
+                #                 imw=imsize[0],
+                #                 imh=imsize[1],
+                #                 show_smpl_joints=viz_smpl_joints,
+                #                 show_pred_joints=viz_pred_joints,
+                #                 show_contacts=viz_contacts
+                #               )
+            all_smpl_joints3d = all_smpl_joints3d.reshape((B, FINAL_EVAL_DIV_NSAMP, -1, 3))
+            samp_dist_mat = torch.zeros((B, FINAL_EVAL_DIV_NSAMP, FINAL_EVAL_DIV_NSAMP-1))
+            for sidx in range(FINAL_EVAL_DIV_NSAMP):
+                other_step_inds = list(range(sidx)) + list(range(sidx + 1, FINAL_EVAL_DIV_NSAMP))
+                # print(other_step_inds)
+                cur_step_motion = all_smpl_joints3d[:,sidx:(sidx+1)]
+                other_step_motions = all_smpl_joints3d[:,other_step_inds]
+                # print(cur_step_motion.size())
+                # print(other_step_motions.size())
+                samp_dist_mat[:,sidx] =  torch.norm(cur_step_motion - other_step_motions, dim=-1).mean(-1)
+                # print(samp_dist_mat[0,sidx])
+
+            cur_apd = torch.mean(samp_dist_mat, dim=[1,2])
+            # print(cur_apd.size())
+            apd_list.append(cur_apd)
+            
+            seq_name = seq_name_list[0]
+            print("{}: APD = {}".format(seq_name, cur_apd))
+            # all_samples_logger[seq_name] = [] 
+            # for i in range(num_samples):
+            #     for j in range(i+1, num_samples):
+            #         x1 = all_samples_joints[i]
+            #         x2 = all_samples_joints[j]
+            #         joint_distance = x1 - x2
+            #         joint_distance = joint_distance.abs().mean()
+            #         all_samples_logger[seq_name].append(joint_distance)
+            # seq_mean = sum(all_samples_logger[seq_name]) / len(all_samples_logger[seq_name])
+            # print("{}: APD = {}".format(seq_name, seq_mean))
+    import pdb; pdb.set_trace()
+    
+    # compute aggregate means
+    agg_adp = torch.cat(apd_list, dim=0).detach().cpu().numpy()
+    header = ['avg_pairwise_dist']
+
+    # output per seq results
+    per_seq_path = os.path.join(res_out_dir, 'per_seq_mean.csv')
+    with open(per_seq_path, 'w') as f:
+        csvw = csv.writer(f, delimiter=',')
+        # write heading
+        csvw.writerow(['seq'] + header)
+        # write data
+        for sidx, seq_name in enumerate(seq_name_list):
+            csvw.writerow([seq_name] + [agg_adp[sidx]])
+
+    # output agg results
+    agg_mean = np.mean(agg_adp)
+    agg_std = np.std(agg_adp)
+    agg_med = np.median(agg_adp)
+    stat_names = ['mean', 'std', 'median']
+    stat_list = [agg_mean, agg_std, agg_med]
+    agg_stat_path = os.path.join(res_out_dir, 'agg_stats.csv')
+    with open(agg_stat_path, 'w') as f:
+        csvw = csv.writer(f, delimiter=',')
+        # write heading
+        csvw.writerow([''] + stat_names)
+        # write data
+        csvw.writerow(header + stat_list)
+        
+
+def get_smpl_joints(global_gt_dict, x_pred_dict, meta, male_bm, female_bm, viz=False):
+    '''
+    Given x_pred_dict from the model rollout and the ground truth dict, runs through SMPL model to get joints
+    '''
+    J = len(SMPL_JOINTS)
+    # V = NUM_MOJO_VERTS
+
+    pred_world_root_orient = x_pred_dict['root_orient'] # B x T x 9
+    B, T, _ = pred_world_root_orient.size()
+    pred_world_root_orient = rotation_matrix_to_angle_axis(pred_world_root_orient.reshape((B*T, 3, 3))).reshape((B, T, 3))
+    pred_world_pose_body = x_pred_dict['pose_body'] # B x T x 189
+    pred_world_pose_body = rotation_matrix_to_angle_axis(pred_world_pose_body.reshape((B*T*(J-1), 3, 3))).reshape((B, T, (J-1)*3))
+    pred_world_trans = x_pred_dict['trans'] # B x T x 3
+    pred_world_joints = x_pred_dict['joints'].reshape((B, T, J, 3))
+
+    meta['betas'] = meta['betas'].repeat(B, 1, 1)
+    meta['gender'] = meta['gender'] * B
+    betas = meta['betas'].to(global_gt_dict[list(global_gt_dict.keys())[0]].device)
+    smpl_joints_out = torch.zeros((B, T, J, 3), dtype=torch.float32)
+    for b in range(B):
+        bm_world = male_bm if meta['gender'][b] == 'male' else female_bm
+        # pred
+        body_pred = bm_world(pose_body=pred_world_pose_body[b], 
+                        pose_hand=None,
+                        betas=betas[b,0].reshape((1, -1)).expand((T, 16)),
+                        root_orient=pred_world_root_orient[b],
+                        trans=pred_world_trans[b])
+        smpl_joints_out[b] = body_pred.Jtr[:, :J]
+
+        if viz and b == 0:
+            from viz.utils import viz_smpl_seq
+            viz_smpl_seq(body_pred, imw=1080, imh=1080, fps=30, contacts=None,
+                    render_body=True, render_joints=True, render_skeleton=False, render_ground=True,
+                    joints_seq=pred_world_joints[b])
+
+    return smpl_joints_out
+
+
 
 def eval_recon(model, test_dataset, test_loader, device, 
                   out_dir=None,

@@ -213,11 +213,11 @@ class HumorModel(nn.Module):
             # need a body model to compute the joints after each step.
             print('Using SMPL joints rather than regressed joints as input at each step for roll out and scheduled sampling...')
             male_bm_path = os.path.join(SMPLH_PATH, 'male/model.npz')
-            self.male_bm = BodyModel(bm_path=male_bm_path, num_betas=16, batch_size=self.smpl_batch_size)
+            self.male_bm = BodyModel(bm_path=male_bm_path, num_betas=16, batch_size=self.args.batch_size)
             female_bm_path = os.path.join(SMPLH_PATH, 'female/model.npz')
-            self.female_bm = BodyModel(bm_path=female_bm_path, num_betas=16, batch_size=self.smpl_batch_size)
+            self.female_bm = BodyModel(bm_path=female_bm_path, num_betas=16, batch_size=self.args.batch_size)
             neutral_bm_path = os.path.join(SMPLH_PATH, 'neutral/model.npz')
-            self.neutral_bm = BodyModel(bm_path=neutral_bm_path, num_betas=16, batch_size=self.smpl_batch_size)
+            self.neutral_bm = BodyModel(bm_path=neutral_bm_path, num_betas=16, batch_size=self.args.batch_size)
             self.bm_dict = {'male' : self.male_bm, 'female' : self.female_bm, 'neutral' : self.neutral_bm}
             for p in self.male_bm.parameters():
                 p.requires_grad = False
@@ -911,12 +911,14 @@ class HumorModel(nn.Module):
                     gender_idx = np.array(gender) == gender_name
                     nbidx = np.sum(gender_idx)
                     cat_idx_map[gender_idx] = np.arange(prev_nbidx, prev_nbidx + nbidx, dtype=np.int)
-                    prev_nbidx += nbidx
-
+                    prev_nbidx += nbidx                    
                     gender_smpl_vals = [val[gender_idx] for val in smpl_vals]
 
                     # need to pad extra frames with zeros in case not as long as expected 
-                    pad_size = self.smpl_batch_size - nbidx
+                    # import pdb; pdb.set_trace()
+                    num_samples = gender_idx.shape[0]
+                    pad_size = num_samples -nbidx
+                    # pad_size = self.smpl_batch_size - nbidx
                     if pad_size == B:
                         # skip if no frames for this gender
                         continue
@@ -929,6 +931,7 @@ class HumorModel(nn.Module):
                     # reconstruct SMPL
                     cur_pred_trans, cur_pred_orient, cur_betas, cur_pred_pose = pad_list
                     bm = self.bm_dict[gender_name]
+               
                     pred_body = bm(pose_body=cur_pred_pose, betas=cur_betas, root_orient=cur_pred_orient, trans=cur_pred_trans)
                     if pad_size > 0:
                         pred_joints.append(pred_body.Jtr[:-pad_size])

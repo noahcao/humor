@@ -8,6 +8,9 @@ import sys
 import cv2
 import pyglet
 
+import os 
+os.environ["PYOPENGL_PLATFORM"] = "egl"
+
 __all__ = ['MeshViewer']
 
 COMPRESS_PARAMS = [cv2.IMWRITE_PNG_COMPRESSION, 9]
