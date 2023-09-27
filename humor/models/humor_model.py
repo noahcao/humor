@@ -873,6 +873,7 @@ class HumorModel(nn.Module):
             z_in = None
             if z_seq is not None:
                 z_in = z_seq[:,t]
+      
             sample_out = self.sample_step(past_in, use_mean=use_mean, z=z_in, return_prior=return_prior, return_z=return_z)
             if return_prior:
                 prior_out = sample_out['prior']

@@ -28,6 +28,40 @@ FINAL_EVAL_PRED_NSAMP = 50
 FINAL_EVAL_DIV_NSAMP = 50
 FINAL_EVAL_DIV_SAMP_LEN = 5 * 30 # 5 s at 30 fps
 
+
+def get_best_ade(predicted, ground_truth):
+    """
+    calculate the ADE on predicted trajectories
+    :param predicted: the predicted trajectories, in form of
+           [num_trajectories, predicted_length, 2]
+    :param ground_truth: ground truth label of predicted trajectories,
+           in form of [num_trajectories, predicted_length, 2]
+
+    :return: average ADE
+    """
+    num_sample, num_frame, num_joints, _ = predicted.shape
+    distance = torch.sum((predicted-ground_truth)**2, dim=-1)
+    sqrt_distance = torch.sum(torch.sqrt(distance), dim=[-1,-2])
+    best_ade = min(sqrt_distance) / (num_frame * num_joints)
+    return best_ade
+
+
+def get_best_fde(predicted, ground_truth):
+    """
+    calculate the FDE on predicted trajectories
+    :param predicted: predicted trajectories, in form of
+          [num_trajectories, predicted_length, 2]
+    :param ground_truth: ground truth label of predicted trajectories,
+          in form of [num_trajectories, predicted_length, 2]
+    :return: average FDE
+    """
+    num_sample, num_frame, num_joints, _ = predicted.shape
+    distance = (predicted[:, -1, :]-ground_truth[:, -1, :])**2
+    sqrt_distance = torch.sum(torch.sqrt(distance), dim=[-1,-2])
+    best_fde =  min(sqrt_distance) / (num_joints)
+    return best_fde
+
+
 def parse_args(argv):
     # create config and parse args
     config = TestConfig(argv)
@@ -202,6 +236,8 @@ def eval_sampling(model, test_dataset, test_loader, device,
 
     all_samples_logger = {}
     apd_list = []
+    ade_list = []
+    fde_list = []
     with torch.no_grad():
         test_dataset.pre_batch()
         model.eval()
@@ -223,6 +259,7 @@ def eval_sampling(model, test_dataset, test_loader, device,
                                                                                 return_global_dict=True)
 
             # roll out predicted motion
+            x_past_origin = x_past.clone()
             B, T, _, _ = x_past.size()
             x_past = x_past[:,0,:,:] # only need input for first step
             rollout_input_dict = dict()
@@ -234,24 +271,24 @@ def eval_sampling(model, test_dataset, test_loader, device,
                 else:
                     assert False
 
-            # sample same trajectory multiple times and save the joints/contacts output
-            # all_samples_joints = []
-            
             all_smpl_joints3d = torch.zeros((B, FINAL_EVAL_DIV_NSAMP, FINAL_EVAL_DIV_SAMP_LEN, J, 3)).to(device)
             
             x_past = x_past.repeat(num_samples, 1, 1)
-            # for samp_idx in range(num_samples):
-            #     # import pdb; pdb.set_trace()
             x_pred_dict = model.roll_out(x_past, rollout_input_dict, 
                                             eval_qual_samp_len, 
                                             gender=meta['gender']*num_samples, 
                                             betas=(meta['betas'].repeat(num_samples, 1,1)).to(device))
 
-            # all_samples_joints.append(x_pred_dict['joints'])
-            # import pdb; pdb.set_trace()
+            gt_joints = batch_in['joints'].squeeze(2)
+            pred_joints = x_pred_dict['joints'].view(num_samples, T, -1, 3).cpu()
+            best_ade = get_best_ade(pred_joints, gt_joints)
+            best_fde = get_best_fde(pred_joints, gt_joints)
+            
             all_smpl_joints3d = get_smpl_joints(global_gt_dict, x_pred_dict, meta, male_bm, female_bm, viz=False)
             # import pdb; pdb.set_trace()
             # visualize and save
+            
+            # NOTE: visualization part
             for samp_idx in range(num_samples):
                 print('Visualizing sample %d/%d!' % (samp_idx+1, num_samples))
                 imsize = (1080, 1080)
@@ -274,20 +311,18 @@ def eval_sampling(model, test_dataset, test_loader, device,
             samp_dist_mat = torch.zeros((B, FINAL_EVAL_DIV_NSAMP, FINAL_EVAL_DIV_NSAMP-1))
             for sidx in range(FINAL_EVAL_DIV_NSAMP):
                 other_step_inds = list(range(sidx)) + list(range(sidx + 1, FINAL_EVAL_DIV_NSAMP))
-                # print(other_step_inds)
                 cur_step_motion = all_smpl_joints3d[:,sidx:(sidx+1)]
                 other_step_motions = all_smpl_joints3d[:,other_step_inds]
-                # print(cur_step_motion.size())
-                # print(other_step_motions.size())
                 samp_dist_mat[:,sidx] =  torch.norm(cur_step_motion - other_step_motions, dim=-1).mean(-1)
-                # print(samp_dist_mat[0,sidx])
+
 
             cur_apd = torch.mean(samp_dist_mat, dim=[1,2])
-            # print(cur_apd.size())
             apd_list.append(cur_apd)
+            ade_list.append(best_ade)
+            fde_list.append(best_fde)
             
             seq_name = seq_name_list[0]
-            print("{}: APD = {}".format(seq_name, cur_apd))
+            print("{}: APD = {}, FDE = {}, ADE = {}".format(seq_name, cur_apd, best_fde, best_ade))
             # all_samples_logger[seq_name] = [] 
             # for i in range(num_samples):
             #     for j in range(i+1, num_samples):
@@ -301,6 +336,8 @@ def eval_sampling(model, test_dataset, test_loader, device,
     
     # compute aggregate means
     agg_adp = torch.cat(apd_list, dim=0).detach().cpu().numpy()
+    agg_ade = torch.stack(ade_list).detach().cpu().numpy()
+    agg_fde = torch.stack(fde_list).detach().cpu().numpy()
     header = ['avg_pairwise_dist']
 
     # output per seq results
@@ -317,15 +354,28 @@ def eval_sampling(model, test_dataset, test_loader, device,
     agg_mean = np.mean(agg_adp)
     agg_std = np.std(agg_adp)
     agg_med = np.median(agg_adp)
+    
+    agg_ade_mean = np.mean(agg_ade)
+    agg_ade_std = np.std(agg_ade)
+    agg_ade_med = np.median(agg_ade)
+    
+    agg_fde_mean = np.mean(agg_fde)
+    agg_fde_std = np.std(agg_fde)
+    agg_fde_med = np.median(agg_fde)
+    
+    # write 
     stat_names = ['mean', 'std', 'median']
     stat_list = [agg_mean, agg_std, agg_med]
     agg_stat_path = os.path.join(res_out_dir, 'agg_stats.csv')
     with open(agg_stat_path, 'w') as f:
         csvw = csv.writer(f, delimiter=',')
         # write heading
-        csvw.writerow([''] + stat_names)
+        csvw.writerow(['Stat.'] + stat_names)
         # write data
         csvw.writerow(header + stat_list)
+        csvw.writerow(['Avg. best-ADE of 50'] + [agg_ade_mean, agg_ade_std, agg_ade_med])
+        csvw.writerow(['Avg. best-FDE of 50'] +[agg_fde_mean, agg_fde_std, agg_fde_med])
+        
         
 
 def get_smpl_joints(global_gt_dict, x_pred_dict, meta, male_bm, female_bm, viz=False):
